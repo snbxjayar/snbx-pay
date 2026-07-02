@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>SNBX Pay Checkout</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #0D1B2A; color: #F0F5F2;
+      min-height: 100vh; display: flex;
+      align-items: center; justify-content: center; padding: 24px;
+    }
+    .card {
+      background: #0F2030; border: 0.5px solid #1A3A2A;
+      border-radius: 18px; padding: 32px;
+      width: 100%; max-width: 420px;
+    }
+    .logo { display: flex; align-items: center; gap: 12px; margin-bottom: 24px; }
+    .logo-mark {
+      width: 40px; height: 40px; border-radius: 12px;
+      background: #1D9E75; display: flex; align-items: center;
+      justify-content: center; font-size: 20px; font-weight: 800; color: #fff;
+    }
+    .logo-text { font-size: 18px; font-weight: 700; }
+    .logo-sub { font-size: 12px; color: #7A9E8E; }
+    .amount-box {
+      background: rgba(29,158,117,0.08); border: 0.5px solid rgba(29,158,117,0.3);
+      border-radius: 12px; padding: 16px; margin-bottom: 24px; text-align: center;
+    }
+    .amount-label { font-size: 12px; color: #7A9E8E; margin-bottom: 4px; }
+    .amount-value { font-size: 28px; font-weight: 700; color: #1D9E75; }
+    .methods { display: flex; flex-direction: column; gap: 10px; margin-bottom: 24px; }
+    .method-btn {
+      display: flex; align-items: center; gap: 14px;
+      background: #0A1929; border: 0.5px solid #1A3A2A;
+      border-radius: 12px; padding: 14px 16px;
+      cursor: pointer; transition: all .15s; color: #F0F5F2;
+      font-size: 14px; font-weight: 500;
+    }
+    .method-btn:hover { border-color: #1D9E75; background: rgba(29,158,117,0.05); }
+    .method-icon { font-size: 24px; width: 32px; text-align: center; }
+    .method-label { flex: 1; text-align: left; }
+    .method-arrow { color: #7A9E8E; }
+    .divider { text-align: center; color: #7A9E8E; font-size: 12px; margin: 4px 0; }
+    .loading {
+      text-align: center; padding: 20px;
+      color: #7A9E8E; display: none;
+    }
+    .spinner {
+      width: 32px; height: 32px; border: 3px solid #1A3A2A;
+      border-top-color: #1D9E75; border-radius: 50%;
+      animation: spin .8s linear infinite; margin: 0 auto 12px;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    .error-msg {
+      background: rgba(224,90,90,0.1); border: 0.5px solid rgba(224,90,90,0.3);
+      border-radius: 10px; padding: 12px; color: #E05A5A;
+      font-size: 13px; margin-top: 12px; display: none; text-align: center;
+    }
+    .footer { text-align: center; font-size: 11px; color: #7A9E8E; margin-top: 20px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="logo">
+      <div class="logo-mark">S</div>
+      <div>
+        <div class="logo-text">SNBX Pay</div>
+        <div class="logo-sub">Secure Checkout</div>
+      </div>
+    </div>
+
+    <div class="amount-box" id="amountBox" style="display:none">
+      <div class="amount-label">Amount Due</div>
+      <div class="amount-value" id="amountDisplay">₱0.00</div>
+    </div>
+
+    <div class="methods" id="methodsSection">
+      <button class="method-btn" onclick="pay('gcash')">
+        <span class="method-icon">💙</span>
+        <span class="method-label">GCash</span>
+        <span class="method-arrow">›</span>
+      </button>
+      <div class="divider">or</div>
+      <button class="method-btn" onclick="pay('paymaya')">
+        <span class="method-icon">💚</span>
+        <span class="method-label">Maya</span>
+        <span class="method-arrow">›</span>
+      </button>
+      <div class="divider">or</div>
+      <button class="method-btn" onclick="pay('card')">
+        <span class="method-icon">💳</span>
+        <span class="method-label">Credit / Debit Card</span>
+        <span class="method-arrow">›</span>
+      </button>
+    </div>
+
+    <div class="loading" id="loadingSection">
+      <div class="spinner"></div>
+      <div>Redirecting to payment...</div>
+    </div>
+
+    <div class="error-msg" id="errorMsg"></div>
+    <div class="footer">Powered by PayMongo · Secured by SNBX Pay</div>
+  </div>
+
+  <script>
+    let paymentData = {};
+
+    // Listen for ALL messages from GHL parent
+    window.addEventListener("message", (event) => {
+      const data = event.data;
+      if (!data || !data.type) return;
+
+      console.log("GHL message type:", data.type);
+      console.log("GHL message data:", JSON.stringify(data));
+
+      if (data.type === "payment_initiate_props") {
+        // Store ALL payment data GHL sends
+        paymentData = data;
+        console.log("Payment data received from GHL:", JSON.stringify(paymentData));
+
+        // Update amount display
+        if (data.amount) {
+          const currency = (data.currency ?? "PHP").toUpperCase();
+          const formatted = new Intl.NumberFormat("en-PH", {
+            style: "currency", currency,
+          }).format(data.amount);
+          document.getElementById("amountDisplay").textContent = formatted;
+          document.getElementById("amountBox").style.display = "block";
+        }
+      }
+    });
+
+    // Signal ready to GHL after page fully loads
+    // GHL will then send payment_initiate_props with real transaction data
+    window.addEventListener("load", () => {
+  // Send multiple times to ensure GHL receives it
+  [300, 800, 1500, 3000].forEach(delay => {
+    setTimeout(() => {
+      console.log(`Sending custom_provider_ready at ${delay}ms`);
+      window.parent.postMessage({ type: "custom_provider_ready" }, "*");
+    }, delay);
+  });
+});
+
+    async function pay(method) {
+      document.getElementById("methodsSection").style.display = "none";
+      document.getElementById("loadingSection").style.display = "block";
+
+      try {
+        const urlParams     = new URLSearchParams(window.location.search);
+        const locationId    = paymentData.locationId
+                           ?? urlParams.get("locationId")
+                           ?? "";
+        const transactionId = paymentData.transactionId
+                           ?? paymentData.orderId
+                           ?? `txn_${Date.now()}`;
+        const amount        = paymentData.amount ?? 100;
+        const currency      = (paymentData.currency ?? "PHP").toUpperCase();
+        const description   = paymentData.productDetails?.name
+                           ?? paymentData.chargeDescription
+                           ?? "SNBX Pay Payment";
+        const contactId     = paymentData.contact?.id ?? "";
+
+        console.log("Initiating payment:", {
+          locationId, transactionId, amount, currency, method, contactId
+        });
+
+        const res = await fetch("https://snbx-pay.vercel.app/api/create-checkout", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            locationId,
+            transactionId,
+            amount,
+            currency,
+            description,
+            paymentMethod: method,
+            contactId,
+          }),
+        });
+
+        const result = await res.json();
+        console.log("Checkout session result:", result);
+
+        if (!res.ok || !result.checkoutUrl) {
+          throw new Error(result.error ?? "Failed to create checkout session");
+        }
+
+        // Redirect parent window to PayMongo checkout
+        window.parent.location.href = result.checkoutUrl;
+
+      } catch (e) {
+        console.error("Payment error:", e.message);
+        document.getElementById("loadingSection").style.display = "none";
+        document.getElementById("methodsSection").style.display = "flex";
+        const errEl = document.getElementById("errorMsg");
+        errEl.textContent = e.message;
+        errEl.style.display = "block";
+
+        window.parent.postMessage({
+          type: "custom_element_error_response",
+          error: { description: e.message }
+        }, "*");
+      }
+    }
+  </script>
+</body>
+</html>

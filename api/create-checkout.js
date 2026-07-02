@@ -1,106 +1,88 @@
 // api/create-checkout.js
-// Place at: snbxsf-pay/api/create-checkout.js
-//
-// Endpoint: POST /api/create-checkout
-// Called by SNBX Pro app when subscriber taps a payment option.
+// Creates a PayMongo checkout session for the iframe flow
 
 const axios = require("axios");
-const { db, admin } = require("../lib/firebaseAdmin");
+const { db } = require("../lib/firebaseAdmin");
 
-// PayMongo secret key — set in Vercel environment variables, never in code
-const PAYMONGO_SECRET_KEY = process.env.PAYMONGO_SECRET_KEY;
-const PAYMONGO_BASE_URL   = "https://api.paymongo.com/v1";
+const PAYMONGO_BASE = "https://api.paymongo.com/v1";
 
-// Where PayMongo redirects after payment (success/failure)
-const SUCCESS_URL = "https://snbxpro.com/payment-success";
-const CANCEL_URL  = "https://snbxpro.com/payment-cancel";
-
-function authHeader() {
-  const encoded = Buffer.from(`${PAYMONGO_SECRET_KEY}:`).toString("base64");
-  return { Authorization: `Basic ${encoded}`, "Content-Type": "application/json" };
+function paymongoAuth(secretKey) {
+  return `Basic ${Buffer.from(`${secretKey}:`).toString("base64")}`;
 }
 
 module.exports = async (req, res) => {
-  // CORS — allow requests from the mobile app
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-
   if (req.method === "OPTIONS") return res.status(200).end();
-  if (req.method !== "POST")    return res.status(405).json({ error: "Method not allowed" });
+  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
   try {
-    const { userId, amount, method, type, description, planTarget } = req.body;
+    const {
+      locationId, transactionId, amount,
+      currency, description, paymentMethod, contactId,
+    } = req.body;
 
-    // ── Validate input ──────────────────────────────────────────────────────
-    if (!userId || !amount || !method || !type || !description) {
-      return res.status(400).json({ error: "Missing required fields." });
-    }
+    if (!locationId) return res.status(400).json({ error: "Missing locationId" });
 
-    const validMethods = ["gcash", "maya", "card"];
-    if (!validMethods.includes(method)) {
-      return res.status(400).json({ error: "Invalid payment method." });
-    }
+    // Get PayMongo credentials for this location
+    const snap = await db.collection("paymongo_credentials").doc(locationId).get();
+    const exists = typeof snap.exists === "function" ? snap.exists() : snap.exists;
+    if (!exists) return res.status(400).json({ error: "No credentials found for this location" });
 
-    const amountCentavos = Math.round(amount * 100); // PayMongo uses centavos
+    const creds     = snap.data();
+    const secretKey = creds.liveMode ? creds.liveSecretKey : creds.testSecretKey;
+    const authHeader = paymongoAuth(secretKey);
 
-    // ── Create PayMongo Checkout Session ────────────────────────────────────
-    const checkoutPayload = {
-      data: {
-        attributes: {
-          send_email_receipt: false,
-          show_description: true,
-          show_line_items: true,
-          line_items: [
-            {
-              currency: "PHP",
-              amount: amountCentavos,
-              name: description,
-              quantity: 1,
-            },
-          ],
-          payment_method_types: [method],
-          description: description,
-          success_url: SUCCESS_URL,
-          cancel_url: CANCEL_URL,
-        },
-      },
-    };
+    // Determine payment methods to show
+    const methods = paymentMethod
+      ? [paymentMethod]
+      : ["gcash", "paymaya", "card"];
 
     const checkoutRes = await axios.post(
-      `${PAYMONGO_BASE_URL}/checkout_sessions`,
-      checkoutPayload,
-      { headers: authHeader() }
+      `${PAYMONGO_BASE}/checkout_sessions`,
+      {
+        data: {
+          attributes: {
+            send_email_receipt:   false,
+            show_description:     true,
+            show_line_items:      true,
+            line_items: [{
+              currency: (currency ?? "PHP").toUpperCase(),
+              amount:   Math.round(amount * 100),
+              name:     description ?? "Payment",
+              quantity: 1,
+            }],
+            payment_method_types: methods,
+            description:          description ?? "Payment via SNBX Pay",
+            success_url: `https://snbx-pay.vercel.app/payment-success?txn=${transactionId}`,
+            cancel_url:  `https://snbx-pay.vercel.app/payment-cancel?txn=${transactionId}`,
+            metadata: { locationId, contactId, transactionId },
+          },
+        },
+      },
+      { headers: { Authorization: authHeader, "Content-Type": "application/json" } }
     );
 
-    const checkoutData      = checkoutRes.data.data;
-    const checkoutId        = checkoutData.id;
-    const checkoutUrl       = checkoutData.attributes.checkout_url;
+    const session = checkoutRes.data.data;
 
-    // ── Save pending payment record to Firestore ────────────────────────────
-    const paymentRef = await db.collection("payments").add({
-      userId,
-      type,                        // "plan_upgrade" | "sim_load" | "renewal"
-      amount,
-      method,
-      status: "pending",
-      description,
-      planTarget: planTarget ?? null,
-      paymongoCheckoutId: checkoutId,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    // Store pending transaction
+    await db.collection("ghl_transactions").doc(transactionId).set({
+      locationId, contactId, transactionId,
+      chargeId:  session.id,
+      amount, currency,
+      status:    "pending",
+      createdAt: new Date(),
     });
 
     return res.status(200).json({
-      checkoutUrl,
-      checkoutId,
-      paymentId: paymentRef.id,
+      success:     true,
+      checkoutUrl: session.attributes.checkout_url,
+      chargeId:    session.id,
     });
 
-  } catch (error) {
-    console.error("create-checkout error:", error?.response?.data || error.message);
-    return res.status(500).json({
-      error: "Failed to create checkout session.",
-      details: error?.response?.data?.errors ?? error.message,
-    });
+  } catch (e) {
+    console.error("Create checkout error:", e?.response?.data || e.message);
+    return res.status(500).json({ error: e?.response?.data?.errors?.[0]?.detail ?? e.message });
   }
 };

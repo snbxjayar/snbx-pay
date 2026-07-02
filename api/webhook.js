@@ -68,12 +68,35 @@ module.exports = async (req, res) => {
 
     // ── Handle checkout session payment events ──────────────────────────────
     if (eventType === "checkout_session.payment.paid") {
-      const checkoutId = eventData?.id;
-      await handlePaymentSuccess(checkoutId);
-    } else if (eventType === "checkout_session.payment.failed") {
-      const checkoutId = eventData?.id;
-      await handlePaymentFailed(checkoutId);
+  const checkoutId = eventData?.id;
+  const metadata   = eventData?.attributes?.metadata ?? {};
+  const { locationId, contactId, transactionId } = metadata;
+
+  // Find transaction by chargeId in case transactionId is a fallback
+  if (transactionId) {
+    try {
+      await db.collection("ghl_transactions").doc(transactionId).update({
+        status:    "paid",
+        paidAt:    new Date(),
+        checkoutId,
+      });
+      console.log(`Transaction ${transactionId} marked as paid`);
+    } catch (e) {
+      // Try finding by chargeId
+      const snap = await db.collection("ghl_transactions")
+        .where("chargeId", "==", checkoutId)
+        .limit(1)
+        .get();
+      
+      if (!snap.empty) {
+        await snap.docs[0].ref.update({ status: "paid", paidAt: new Date() });
+        console.log(`Transaction found by chargeId and marked as paid`);
+      } else {
+        console.log(`No transaction found for checkoutId: ${checkoutId}`);
+      }
     }
+  }
+}
 
     return res.status(200).json({ received: true });
 
