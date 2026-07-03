@@ -11,7 +11,11 @@ const crypto = require("crypto");
 const axios  = require("axios");
 const { db } = require("../lib/firebaseAdmin");
 
-const PAYMONGO_WEBHOOK_SECRET = process.env.PAYMONGO_WEBHOOK_SECRET;
+const WEBHOOK_SECRETS = [
+  process.env.PAYMONGO_WEBHOOK_SECRET_LIVE,
+  process.env.PAYMONGO_WEBHOOK_SECRET_TEST,
+  process.env.PAYMONGO_WEBHOOK_SECRET, // legacy fallback
+].filter(Boolean);
 const GHL_BASE = "https://services.leadconnectorhq.com";
 
 // Vercel needs raw body for signature verification — disable default parsing
@@ -104,7 +108,9 @@ module.exports = async (req, res) => {
     const signatureHeader = req.headers["paymongo-signature"];
 
     // ── Verify this request actually came from PayMongo ─────────────────
-    const isValid = verifySignature(rawBody, signatureHeader, PAYMONGO_WEBHOOK_SECRET);
+    const isValid = WEBHOOK_SECRETS.some(secret =>
+      verifySignature(rawBody, signatureHeader, secret)
+    );
     if (!isValid) {
       console.warn("Webhook signature verification failed.");
       return res.status(401).json({ error: "Invalid signature." });

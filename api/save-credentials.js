@@ -159,31 +159,40 @@ module.exports = async (req, res) => {
     }
 
     try {
-      // Save credentials to Firestore
-      await db.collection("paymongo_credentials").doc(locationId).set({
-        locationId,
-        testPublicKey:  testPublicKey ?? "",
-        testSecretKey:  testSecretKey ?? "",
-        livePublicKey:  livePublicKey ?? "",
-        liveSecretKey:  liveSecretKey ?? "",
-        liveMode:       liveMode ?? false,
-        updatedAt:      new Date(),
-      }, { merge: true });
+      // Save credentials to Firestore — only overwrite fields actually provided
+      const updates = { locationId, updatedAt: new Date() };
+      if (testPublicKey)  updates.testPublicKey  = testPublicKey;
+      if (testSecretKey)  updates.testSecretKey  = testSecretKey;
+      if (livePublicKey)  updates.livePublicKey  = livePublicKey;
+      if (liveSecretKey)  updates.liveSecretKey  = liveSecretKey;
+      if (liveMode !== undefined) updates.liveMode = liveMode;
+
+      await db.collection("paymongo_credentials").doc(locationId).set(updates, { merge: true });
 
       // Get fresh token once — reuse for both calls
       const token = await refreshLocationToken(locationId);
 
-      // Step 1 — Create base config (safe to call even if already exists)
-      await createBaseConfig(locationId, token);
+      // Step 1 — Create base config only if none exists yet
+      const existing = await axios.get(
+        `${GHL_BASE}/payments/custom-provider/connect?locationId=${locationId}`,
+        { headers: { Authorization: `Bearer ${token}`, Version: "2021-07-28" } }
+      ).catch(() => null);
 
-      // Step 2 — Connect test mode credentials
-      if (testSecretKey) {
-        await connectConfig(locationId, "test", testSecretKey, testPublicKey, token);
+      if (existing?.data) {
+        console.log("Provider config already exists — skipping createBaseConfig");
+      } else {
+        await createBaseConfig(locationId, token);
       }
 
-      // Step 2 — Connect live mode credentials
-      if (liveSecretKey) {
-        await connectConfig(locationId, "live", liveSecretKey, livePublicKey, token);
+      // Step 2 — Connect BOTH modes using merged credentials (request + stored)
+      const mergedSnap = await db.collection("paymongo_credentials").doc(locationId).get();
+      const merged = mergedSnap.data();
+
+      if (merged.testSecretKey) {
+        await connectConfig(locationId, "test", merged.testSecretKey, merged.testPublicKey, token);
+      }
+      if (merged.liveSecretKey) {
+        await connectConfig(locationId, "live", merged.liveSecretKey, merged.livePublicKey, token);
       }
 
       return res.status(200).json({ success: true });

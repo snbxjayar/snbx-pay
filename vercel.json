@@ -9,7 +9,8 @@
   "rewrites": [
     { "source": "/setup", "destination": "/api/setup" },
     { "source": "/checkout", "destination": "/api/checkout" },
-    { "source": "/payment-success", "destination": "/api/payment-success" },
-    { "source": "/payment-cancel", "destination": "/api/payment-cancel" }
+    { "source": "/api/payment-success", "destination": "/api/payment-result?outcome=success" },
+    { "source": "/api/payment-cancel", "destination": "/api/payment-result?outcome=cancel" }
+  
   ]
 }

@@ -1,32 +1,40 @@
-// test-ghl-webhook.js
+// test-provider-config.js
 require("dotenv").config();
 const axios = require("axios");
+const { db } = require("./lib/firebaseAdmin");
+
+const GHL_BASE = "https://services.leadconnectorhq.com";
+const LOCATION_ID = "fBmHS43QUr0H51dHbiqr";
+
+async function getOAuthToken() {
+  const snap = await db.collection("ghl_installations").doc(LOCATION_ID).get();
+  const { refreshToken } = snap.data();
+  const res = await axios.post(`${GHL_BASE}/oauth/token`, new URLSearchParams({
+    client_id: process.env.GHL_CLIENT_ID,
+    client_secret: process.env.GHL_CLIENT_SECRET,
+    grant_type: "refresh_token",
+    refresh_token: refreshToken,
+    user_type: "Location",
+  }), { headers: { "Content-Type": "application/x-www-form-urlencoded" } });
+  await db.collection("ghl_installations").doc(LOCATION_ID).update({
+    accessToken: res.data.access_token,
+    refreshToken: res.data.refresh_token,
+  });
+  return res.data.access_token;
+}
 
 async function main() {
-  const payload = {
-    event: "payment.captured",
-    chargeId: "cs_test_manual_confirm_001", // your PayMongo checkout/charge id
-    ghlTransactionId: "6a470a7222eb9510d9101632",
-    chargeSnapshot: {
-      status: "succeeded",
-      amount: 100,            // if this fails or records ₱1.00, try 10000 (minor units)
-      chargeId: "cs_test_manual_confirm_001",
-      chargedAt: Math.floor(Date.now() / 1000),
-    },
-    locationId: "fBmHS43QUr0H51dHbiqr",
-    apiKey: process.env.PAYMONGO_SECRET_KEY || "PASTE_YOUR_TEST_SECRET_KEY_HERE",
-  };
+  const token = await getOAuthToken();
 
+  // 1. Fetch provider config (the /connect path)
   try {
-    const res = await axios.post(
-      "https://backend.leadconnectorhq.com/payments/custom-provider/webhook",
-      payload,
-      { headers: { "Content-Type": "application/json" } }
-    );
-    console.log("Status:", res.status);
-    console.log("Response:", JSON.stringify(res.data, null, 2));
+    const res = await axios.get(`${GHL_BASE}/payments/custom-provider/connect`, {
+      params: { locationId: LOCATION_ID },
+      headers: { Authorization: `Bearer ${token}`, Version: "2021-07-28" },
+    });
+    console.log("CONFIG:", JSON.stringify(res.data, null, 2));
   } catch (e) {
-    console.log("ERR", e?.response?.status, JSON.stringify(e?.response?.data, null, 2));
+    console.log("CONFIG ERR", e?.response?.status, JSON.stringify(e?.response?.data));
   }
 }
 main();

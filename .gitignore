@@ -4,3 +4,5 @@ node_modules/
 *.json.key
 service-account*.json
 .vercel
+test-list-orders.js
+test-record-order-payment.js

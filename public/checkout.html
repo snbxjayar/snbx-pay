@@ -89,6 +89,17 @@
         <span class="method-label">Maya</span>
         <span class="method-arrow">›</span>
       </button>
+      <button class="method-btn" onclick="pay('grab_pay')">
+  <span class="method-icon">🟢</span>
+  <span class="method-label">GrabPay</span>
+  <span class="method-arrow">›</span>
+</button>
+<div class="divider">or</div>
+<button class="method-btn" onclick="pay('qrph')">
+  <span class="method-icon">🇵🇭</span>
+  <span class="method-label">QR Ph</span>
+  <span class="method-arrow">›</span>
+</button>
       <div class="divider">or</div>
       <button class="method-btn" onclick="pay('card')">
         <span class="method-icon">💳</span>
@@ -166,52 +177,67 @@
 
     // ── Payment flow — server resolves the real GHL transaction ──
     async function pay(method) {
-      document.getElementById("methodsSection").style.display = "none";
-      document.getElementById("loadingSection").style.display = "block";
+  document.getElementById("methodsSection").style.display = "none";
+  document.getElementById("loadingSection").style.display = "block";
+  document.getElementById("errorMsg").style.display = "none";
+
+  // Detect if user closes the popup without completing payment
+const popupWatcher = setInterval(() => {
+  if (popup.closed) {
+    clearInterval(popupWatcher);
+    // Only reset if payment wasn't already confirmed
+    if (!window.__snbxPaid) {
+      document.getElementById("loadingSection").style.display = "none";
+      document.getElementById("methodsSection").style.display = "flex";
       document.getElementById("errorMsg").style.display = "none";
-
-      try {
-        const locationId = window.__SNBX_LOCATION_ID__
-                        || paymentData.locationId
-                        || "";
-
-        console.log("Initiating payment:", { locationId, method });
-
-        const res = await fetch("https://snbx-pay.vercel.app/api/create-checkout", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            locationId,
-            paymentMethod: method,
-          }),
-        });
-
-        const result = await res.json();
-        console.log("Checkout session result:", result);
-
-        if (!res.ok || !result.checkoutUrl) {
-          throw new Error(result.error ?? "Failed to create checkout session");
-        }
-
-        const popup = window.open(result.checkoutUrl, "snbxpay_checkout", "width=480,height=720");
-        if (!popup) {
-          throw new Error("Popup blocked — please allow popups for this site and try again.");
-        }
-
-      } catch (e) {
-        console.error("Payment error:", e.message);
-        document.getElementById("loadingSection").style.display = "none";
-        document.getElementById("methodsSection").style.display = "flex";
-        const errEl = document.getElementById("errorMsg");
-        errEl.textContent = e.message;
-        errEl.style.display = "block";
-
-        window.parent.postMessage({
-          type: "custom_element_error_response",
-          error: { description: e.message }
-        }, "*");
-      }
     }
+  }
+}, 800);
+
+  // Open popup IMMEDIATELY while still in the click gesture — browsers allow this
+  const popup = window.open("about:blank", "snbxpay_checkout", "width=480,height=720");
+  if (!popup) {
+    document.getElementById("loadingSection").style.display = "none";
+    document.getElementById("methodsSection").style.display = "flex";
+    const errEl = document.getElementById("errorMsg");
+    errEl.textContent = "Popup blocked — please allow popups for this site and try again.";
+    errEl.style.display = "block";
+    return;
+  }
+  popup.document.write("<body style='font-family:sans-serif;background:#0D1B2A;color:#7A9E8E;display:flex;align-items:center;justify-content:center;height:100vh'>Loading secure checkout…</body>");
+
+  try {
+    const locationId = window.__SNBX_LOCATION_ID__ || paymentData.locationId || "";
+
+    const res = await fetch("https://snbx-pay.vercel.app/api/create-checkout", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ locationId, paymentMethod: method }),
+    });
+
+    const result = await res.json();
+    if (!res.ok || !result.checkoutUrl) {
+      popup.close();
+      throw new Error(result.error ?? "Failed to create checkout session");
+    }
+
+    // Navigate the already-open popup to PayMongo
+    popup.location.href = result.checkoutUrl;
+
+  } catch (e) {
+    console.error("Payment error:", e.message);
+    document.getElementById("loadingSection").style.display = "none";
+    document.getElementById("methodsSection").style.display = "flex";
+    const errEl = document.getElementById("errorMsg");
+    errEl.textContent = e.message;
+    errEl.style.display = "block";
+
+    window.parent.postMessage({
+      type: "custom_element_error_response",
+      error: { description: e.message }
+    }, "*");
+  }
+}
   </script>
 </body>
 </html>
