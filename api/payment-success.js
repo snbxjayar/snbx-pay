@@ -24,14 +24,19 @@ body{font-family:sans-serif;background:#0D1B2A;color:#F0F5F2;display:flex;align-
 .icon{font-size:60px;margin-bottom:20px;}
 h2{color:#1D9E75;margin-bottom:10px;}
 p{color:#7A9E8E;margin-bottom:20px;}
-.btn{background:#1D9E75;color:#fff;border:none;padding:12px 24px;border-radius:10px;font-size:14px;font-weight:700;cursor:pointer;}
 </style></head>
 <body><div class="card">
 <div class="icon">✅</div>
 <h2>Payment Successful!</h2>
-<p>Your payment has been processed. You can close this window.</p>
-<button class="btn" onclick="window.close()">Close Window</button>
-</div></body></html>`;
+<p>Closing automatically...</p>
+</div>
+<script>
+  if (window.opener) {
+    window.opener.postMessage({ type: "SNBX_PAYMENT_DONE", status: "paid", chargeId: "${txn}" }, "*");
+  }
+  setTimeout(() => window.close(), 1200);
+</script>
+</body></html>`;
 
   res.setHeader("Content-Type", "text/html");
   res.status(200).send(html);

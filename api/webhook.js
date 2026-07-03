@@ -1,14 +1,18 @@
 // api/webhook.js
-// Place at: snbxsf-pay/api/webhook.js
 //
 // Endpoint: POST /api/webhook
 // Called by PayMongo automatically when a payment succeeds or fails.
-// You must register this URL in PayMongo Dashboard → Developers → Webhooks.
+// Registered in PayMongo Dashboard → Developers → Webhooks.
+//
+// Flow: PayMongo payment.paid → update Firestore → send payment.captured
+// to GHL so the Order/Transaction flips to Completed (triggers workflows).
 
 const crypto = require("crypto");
-const { db, admin } = require("../lib/firebaseAdmin");
+const axios  = require("axios");
+const { db } = require("../lib/firebaseAdmin");
 
 const PAYMONGO_WEBHOOK_SECRET = process.env.PAYMONGO_WEBHOOK_SECRET;
+const GHL_BASE = "https://services.leadconnectorhq.com";
 
 // Vercel needs raw body for signature verification — disable default parsing
 module.exports.config = {
@@ -35,7 +39,7 @@ function verifySignature(rawBody, signatureHeader, secret) {
   }, {});
 
   const timestamp = parts.t;
-  const signature = parts.li || parts.te; // live or test signature
+  const signature = parts.li || parts.te;
 
   const signedPayload = `${timestamp}.${rawBody}`;
   const expectedSignature = crypto
@@ -46,6 +50,52 @@ function verifySignature(rawBody, signatureHeader, secret) {
   return signature === expectedSignature;
 }
 
+// Fallback only: find newest pending GHL transaction by amount + recency.
+// Used if the stored transactionId is somehow not a real GHL transaction id.
+async function findGhlTransaction(locationId, amount) {
+  const res = await axios.get(`${GHL_BASE}/payments/transactions`, {
+    params: { altId: locationId, altType: "location" },
+    headers: {
+      Authorization: `Bearer ${process.env.GHL_PIT_TOKEN}`,
+      Version: "2021-07-28",
+    },
+  });
+
+  const txns = res.data?.data ?? [];
+  const cutoff = Date.now() - 30 * 60 * 1000;
+  return txns.find(t =>
+    t.status === "pending" &&
+    Number(t.amount) === Number(amount) &&
+    new Date(t.createdAt).getTime() > cutoff
+  );
+}
+
+// Tell GHL the payment was captured — flips Order/Transaction to Completed
+async function notifyGhlPaymentCaptured(locationId, ghlTransactionId, chargeId, amount, liveMode) {
+  const credsSnap = await db.collection("paymongo_credentials").doc(locationId).get();
+  const creds = credsSnap.data();
+  const apiKey = liveMode ? creds.liveSecretKey : creds.testSecretKey;
+
+  const res = await axios.post(
+    "https://backend.leadconnectorhq.com/payments/custom-provider/webhook",
+    {
+      event: "payment.captured",
+      chargeId,
+      ghlTransactionId,
+      chargeSnapshot: {
+        status: "succeeded",
+        amount: Number(amount),
+        chargeId,
+        chargedAt: Math.floor(Date.now() / 1000),
+      },
+      locationId,
+      apiKey,
+    },
+    { headers: { "Content-Type": "application/json" } }
+  );
+  console.log(`GHL payment.captured sent for txn ${ghlTransactionId}:`, res.status);
+}
+
 module.exports = async (req, res) => {
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
 
@@ -53,50 +103,76 @@ module.exports = async (req, res) => {
     const rawBody = await getRawBody(req);
     const signatureHeader = req.headers["paymongo-signature"];
 
-    // ── Verify this request actually came from PayMongo ─────────────────────
+    // ── Verify this request actually came from PayMongo ─────────────────
     const isValid = verifySignature(rawBody, signatureHeader, PAYMONGO_WEBHOOK_SECRET);
     if (!isValid) {
       console.warn("Webhook signature verification failed.");
       return res.status(401).json({ error: "Invalid signature." });
     }
 
-    const event = JSON.parse(rawBody);
+    const event     = JSON.parse(rawBody);
     const eventType = event.data?.attributes?.type;
-    const eventData  = event.data?.attributes?.data;
+    const eventData = event.data?.attributes?.data;
 
     console.log("PayMongo webhook received:", eventType);
 
-    // ── Handle checkout session payment events ──────────────────────────────
+    // ── Handle successful checkout payment ──────────────────────────────
     if (eventType === "checkout_session.payment.paid") {
-  const checkoutId = eventData?.id;
-  const metadata   = eventData?.attributes?.metadata ?? {};
-  const { locationId, contactId, transactionId } = metadata;
+      const checkoutId = eventData?.id;
+      const metadata   = eventData?.attributes?.metadata ?? {};
+      const { locationId, transactionId } = metadata;
 
-  // Find transaction by chargeId in case transactionId is a fallback
-  if (transactionId) {
-    try {
-      await db.collection("ghl_transactions").doc(transactionId).update({
-        status:    "paid",
-        paidAt:    new Date(),
-        checkoutId,
-      });
-      console.log(`Transaction ${transactionId} marked as paid`);
-    } catch (e) {
-      // Try finding by chargeId
-      const snap = await db.collection("ghl_transactions")
-        .where("chargeId", "==", checkoutId)
-        .limit(1)
-        .get();
-      
-      if (!snap.empty) {
-        await snap.docs[0].ref.update({ status: "paid", paidAt: new Date() });
-        console.log(`Transaction found by chargeId and marked as paid`);
+      if (transactionId) {
+        // 1. Update our own Firestore record
+        let storedTxn = null;
+        try {
+          const docRef = db.collection("ghl_transactions").doc(transactionId);
+          await docRef.update({
+            status:  "paid",
+            paidAt:  new Date(),
+            checkoutId,
+          });
+          const snap = await docRef.get();
+          storedTxn = snap.data();
+          console.log(`Transaction ${transactionId} marked as paid in Firestore`);
+        } catch (e) {
+          console.error("Firestore update error:", e.message);
+        }
+
+        // 2. Sync status to GHL — flips Order/Transaction to Completed
+        try {
+          if (storedTxn) {
+            // transactionId is the real GHL transaction _id (set by create-checkout)
+            await notifyGhlPaymentCaptured(
+              locationId,
+              transactionId,
+              checkoutId,
+              storedTxn.amount,
+              storedTxn.liveMode ?? false
+            );
+          } else {
+            // Fallback: match by amount + recency
+            const amountPaid = (eventData?.attributes?.line_items?.[0]?.amount ?? 0) / 100;
+            const ghlTxn = await findGhlTransaction(locationId, amountPaid);
+            if (ghlTxn) {
+              await notifyGhlPaymentCaptured(
+                locationId,
+                ghlTxn._id,
+                checkoutId,
+                ghlTxn.amount,
+                ghlTxn.liveMode ?? false
+              );
+            } else {
+              console.warn("No matching pending GHL transaction found for amount:", amountPaid);
+            }
+          }
+        } catch (e) {
+          console.error("GHL sync error:", e?.response?.data || e.message);
+        }
       } else {
-        console.log(`No transaction found for checkoutId: ${checkoutId}`);
+        console.warn("No transactionId in PayMongo metadata — cannot sync to GHL.");
       }
     }
-  }
-}
 
     return res.status(200).json({ received: true });
 
@@ -105,82 +181,3 @@ module.exports = async (req, res) => {
     return res.status(500).json({ error: "Webhook processing failed." });
   }
 };
-
-// ── Handle successful payment ───────────────────────────────────────────────
-async function handlePaymentSuccess(checkoutId) {
-  const paymentsSnap = await db
-    .collection("payments")
-    .where("paymongoCheckoutId", "==", checkoutId)
-    .limit(1)
-    .get();
-
-  if (paymentsSnap.empty) {
-    console.warn("No matching payment found for checkout:", checkoutId);
-    return;
-  }
-
-  const paymentDoc = paymentsSnap.docs[0];
-  const payment    = paymentDoc.data();
-
-  // 1. Update payment status to paid
-  await paymentDoc.ref.update({
-    status: "paid",
-    paidAt: admin.firestore.FieldValue.serverTimestamp(),
-  });
-
-  // 2. If this was a plan upgrade, update the subscriber's plan
-  if (payment.type === "plan_upgrade" && payment.planTarget) {
-    const subsSnap = await db
-      .collection("subscriptions")
-      .where("userId", "==", payment.userId)
-      .limit(1)
-      .get();
-
-    if (!subsSnap.empty) {
-      const subDoc = subsSnap.docs[0];
-      const newRenewal = new Date();
-      newRenewal.setDate(newRenewal.getDate() + 30);
-
-      await subDoc.ref.update({
-        plan: payment.planTarget,
-        status: "active",
-        renewalDate: newRenewal,
-        updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-      });
-      console.log(`Subscription updated to ${payment.planTarget} for user ${payment.userId}`);
-    } else {
-      console.warn("No subscription doc found for user:", payment.userId);
-    }
-  }
-
-  // 3. If this was a SIM load top-up, log it (optional: track load balance)
-  if (payment.type === "sim_load") {
-    await db.collection("sim_load_history").add({
-      userId: payment.userId,
-      amount: payment.amount,
-      paymentId: paymentDoc.id,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
-    });
-  }
-
-  console.log(`Payment ${paymentDoc.id} marked as paid.`);
-}
-
-// ── Handle failed payment ───────────────────────────────────────────────────
-async function handlePaymentFailed(checkoutId) {
-  const paymentsSnap = await db
-    .collection("payments")
-    .where("paymongoCheckoutId", "==", checkoutId)
-    .limit(1)
-    .get();
-
-  if (paymentsSnap.empty) return;
-
-  const paymentDoc = paymentsSnap.docs[0];
-  await paymentDoc.ref.update({
-    status: "failed",
-    failedAt: admin.firestore.FieldValue.serverTimestamp(),
-  });
-
-  console.log(`Payment ${paymentDoc.id} marked as failed.`);
-}

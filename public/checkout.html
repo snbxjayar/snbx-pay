@@ -109,20 +109,37 @@
   <script>
     let paymentData = {};
 
-    // Listen for ALL messages from GHL parent
+    // ── Listen for popup completion (payment-success / payment-cancel) ──
+    window.addEventListener("message", (event) => {
+      const data = event.data;
+      if (data?.type === "SNBX_PAYMENT_DONE") {
+        console.log("Received SNBX_PAYMENT_DONE, forwarding to GHL:", JSON.stringify(data));
+
+        const payload = data.status === "paid"
+          ? { type: "custom_element_success_response", chargeId: data.chargeId }
+          : { type: "custom_element_error_response", error: { description: "Payment was cancelled or failed." } };
+
+        window.parent.postMessage(payload, "*");
+        if (window.top !== window.parent) {
+          window.top.postMessage(payload, "*");
+        }
+
+        document.getElementById("loadingSection").style.display = "none";
+        if (data.status !== "paid") {
+          document.getElementById("methodsSection").style.display = "flex";
+        }
+      }
+    });
+
+    // ── Listen for GHL payment data (if the platform ever sends it) ──
     window.addEventListener("message", (event) => {
       const data = event.data;
       if (!data || !data.type) return;
 
-      console.log("GHL message type:", data.type);
-      console.log("GHL message data:", JSON.stringify(data));
-
       if (data.type === "payment_initiate_props") {
-        // Store ALL payment data GHL sends
         paymentData = data;
         console.log("Payment data received from GHL:", JSON.stringify(paymentData));
 
-        // Update amount display
         if (data.amount) {
           const currency = (data.currency ?? "PHP").toUpperCase();
           const formatted = new Intl.NumberFormat("en-PH", {
@@ -134,52 +151,38 @@
       }
     });
 
-    // Signal ready to GHL after page fully loads
-    // GHL will then send payment_initiate_props with real transaction data
+    // ── Signal ready to GHL after page fully loads ──
     window.addEventListener("load", () => {
-  // Send multiple times to ensure GHL receives it
-  [300, 800, 1500, 3000].forEach(delay => {
-    setTimeout(() => {
-      console.log(`Sending custom_provider_ready at ${delay}ms`);
-      window.parent.postMessage({ type: "custom_provider_ready" }, "*");
-    }, delay);
-  });
-});
+      [300, 800, 1500, 3000].forEach(delay => {
+        setTimeout(() => {
+          const payload = { type: "custom_provider_ready", loaded: true };
+          window.parent.postMessage(payload, "*");
+          if (window.top !== window.parent) {
+            window.top.postMessage(payload, "*");
+          }
+        }, delay);
+      });
+    });
 
+    // ── Payment flow — server resolves the real GHL transaction ──
     async function pay(method) {
       document.getElementById("methodsSection").style.display = "none";
       document.getElementById("loadingSection").style.display = "block";
+      document.getElementById("errorMsg").style.display = "none";
 
       try {
-        const urlParams     = new URLSearchParams(window.location.search);
-        const locationId    = paymentData.locationId
-                           ?? urlParams.get("locationId")
-                           ?? "";
-        const transactionId = paymentData.transactionId
-                           ?? paymentData.orderId
-                           ?? `txn_${Date.now()}`;
-        const amount        = paymentData.amount ?? 100;
-        const currency      = (paymentData.currency ?? "PHP").toUpperCase();
-        const description   = paymentData.productDetails?.name
-                           ?? paymentData.chargeDescription
-                           ?? "SNBX Pay Payment";
-        const contactId     = paymentData.contact?.id ?? "";
+        const locationId = window.__SNBX_LOCATION_ID__
+                        || paymentData.locationId
+                        || "";
 
-        console.log("Initiating payment:", {
-          locationId, transactionId, amount, currency, method, contactId
-        });
+        console.log("Initiating payment:", { locationId, method });
 
         const res = await fetch("https://snbx-pay.vercel.app/api/create-checkout", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             locationId,
-            transactionId,
-            amount,
-            currency,
-            description,
             paymentMethod: method,
-            contactId,
           }),
         });
 
@@ -190,8 +193,10 @@
           throw new Error(result.error ?? "Failed to create checkout session");
         }
 
-        // Redirect parent window to PayMongo checkout
-        window.parent.location.href = result.checkoutUrl;
+        const popup = window.open(result.checkoutUrl, "snbxpay_checkout", "width=480,height=720");
+        if (!popup) {
+          throw new Error("Popup blocked — please allow popups for this site and try again.");
+        }
 
       } catch (e) {
         console.error("Payment error:", e.message);

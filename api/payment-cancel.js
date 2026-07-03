@@ -1,5 +1,7 @@
 // api/payment-cancel.js
 module.exports = (req, res) => {
+  const { txn } = req.query;
+
   const html = `<!DOCTYPE html>
 <html><head><meta charset="UTF-8"/><title>Payment Cancelled</title>
 <style>
@@ -13,9 +15,16 @@ p{color:#7A9E8E;margin-bottom:20px;}
 <body><div class="card">
 <div class="icon">❌</div>
 <h2>Payment Cancelled</h2>
-<p>Your payment was cancelled. You can close this window and try again.</p>
+<p>Closing automatically...</p>
 <button class="btn" onclick="window.close()">Close Window</button>
-</div></body></html>`;
+</div>
+<script>
+  if (window.opener) {
+    window.opener.postMessage({ type: "SNBX_PAYMENT_DONE", status: "cancelled", chargeId: "${txn || ''}" }, "*");
+  }
+  setTimeout(() => window.close(), 1500);
+</script>
+</body></html>`;
 
   res.setHeader("Content-Type", "text/html");
   res.status(200).send(html);

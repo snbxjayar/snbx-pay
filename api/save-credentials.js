@@ -61,7 +61,7 @@ async function createBaseConfig(locationId, token) {
     description: "Accept GCash, Maya & Card payments via PayMongo",
     imageUrl:    "https://snbxpro.com/assets/snbx-pay-logo.png",
     queryUrl:    "https://snbx-pay.vercel.app/api/query",
-    paymentsUrl: `https://snbx-pay.vercel.app/api/checkout?locationId=${locationId}`,
+    paymentsUrl: `https://snbx-pay.vercel.app/api/checkout/${locationId}`,
   },
       {
         headers: {
