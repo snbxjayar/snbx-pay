@@ -1,5 +1,5 @@
 // api/sms/[[...route]].js — SNBX SMS: all routes in one function (Hobby plan friendly)
-const { db, admin, saveTokens } = require("./_lib");
+const { db, admin, saveTokens } = require("./sms/_lib");
 
 // Normalize PH numbers to +639XXXXXXXXX
 function formatPHNumber(phone) {
@@ -88,7 +88,7 @@ async function handleOutbound(req, res) {
 
 // ── Router ──────────────────────────────────────────────────────
 module.exports = async (req, res) => {
-  const route = (req.query.route || []).join("/"); // e.g. "oauth/callback", "outbound"
+  const route = String(req.query.route || "");
 
   if (route === "oauth/callback") return handleOAuthCallback(req, res);
   if (route === "outbound") return handleOutbound(req, res);

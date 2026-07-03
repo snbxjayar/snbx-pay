@@ -10,7 +10,7 @@
     { "source": "/setup", "destination": "/api/setup" },
     { "source": "/checkout", "destination": "/api/checkout" },
     { "source": "/api/payment-success", "destination": "/api/payment-result?outcome=success" },
-    { "source": "/api/payment-cancel", "destination": "/api/payment-result?outcome=cancel" }
-  
+    { "source": "/api/payment-cancel", "destination": "/api/payment-result?outcome=cancel" },
+    { "source": "/api/sms/:path*", "destination": "/api/sms-router?route=:path*" }
   ]
 }
