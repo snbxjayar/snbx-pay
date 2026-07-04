@@ -1,5 +1,8 @@
-// api/sms/[[...route]].js — SNBX SMS: all routes in one function (Hobby plan friendly)
-const { db, admin, saveTokens } = require("./sms/_lib");
+// api/sms-router.js — SNBX SMS: all routes in one function (Hobby plan friendly)
+// Routes (via vercel.json rewrite):
+//   /api/sms/oauth/callback → OAuth install
+//   /api/sms/outbound       → GHL Conversation Provider webhook
+const { db, admin, saveTokens, updateGHLMessageStatus } = require("./sms/_lib");
 
 // Normalize PH numbers to +639XXXXXXXXX
 function formatPHNumber(phone) {
@@ -8,6 +11,21 @@ function formatPHNumber(phone) {
   else if (p.startsWith("639")) p = "+" + p;
   else if (p.startsWith("9") && p.length === 10) p = "+63" + p;
   return p;
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Poll a job doc until it reaches sent/failed, or timeout
+async function waitForJobResult(jobId, timeoutMs = 8000, intervalMs = 1000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const doc = await db.collection("sms_jobs").doc(jobId).get();
+    const status = doc.exists ? doc.data().status : null;
+    if (status === "sent") return { status: "sent" };
+    if (status === "failed") return { status: "failed", error: doc.data().error || "Send failed on device" };
+    await sleep(intervalMs);
+  }
+  return { status: "timeout" };
 }
 
 // ── Route: /api/sms/oauth/callback ──────────────────────────────
@@ -66,7 +84,7 @@ async function handleOutbound(req, res) {
       return res.status(400).json({ error: "Missing locationId, phone, or message" });
     }
 
-    await db.collection("sms_jobs").add({
+    const jobRef = await db.collection("sms_jobs").add({
       locationId,
       ghlMessageId: messageId || null,
       contactId: contactId || null,
@@ -78,10 +96,115 @@ async function handleOutbound(req, res) {
       createdAt: new Date(),
     });
 
-    console.log(`[SMS Outbound] Queued job for ${phone} (location ${locationId})`);
+    console.log(`[SMS Outbound] Queued job ${jobRef.id} for ${phone} (location ${locationId})`);
+
+// ── FCM wake-up: nudge the gateway device (works even if app is killed) ──
+    try {
+      await admin.messaging().send({
+        topic: "sms_gateway",
+        android: { priority: "high" },
+        data: { type: "sms_job", jobId: jobRef.id },
+      });
+      console.log(`[SMS Outbound] FCM wake-up sent for job ${jobRef.id}`);
+    } catch (fcmErr) {
+      console.error("[SMS Outbound] FCM send failed (job still queued):", fcmErr.message);
+    }
+
+    // ── Status feedback loop (Option A: poll for result) ──
+    if (messageId) {
+      const result = await waitForJobResult(jobRef.id);
+      console.log(`[SMS Outbound] Job ${jobRef.id} result: ${result.status}`);
+
+      if (result.status === "sent") {
+        await updateGHLMessageStatus(locationId, messageId, "delivered");
+      } else if (result.status === "failed") {
+        await updateGHLMessageStatus(locationId, messageId, "failed", result.error);
+      }
+      // On timeout: leave GHL as pending — the gateway may still send it late.
+    }
+
     return res.status(200).json({ success: true });
   } catch (err) {
     console.error("[SMS Outbound] Error:", err);
+    return res.status(500).json({ error: "Internal error" });
+  }
+}
+
+// ── Route: /api/sms/inbound ─────────────────────────────────────
+// Called by the gateway app when a subscriber's phone receives an SMS
+async function handleInbound(req, res) {
+  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
+
+  try {
+    const { deviceId, from, body } = req.body || {};
+    console.log("[SMS Inbound] Payload:", JSON.stringify(req.body));
+
+    if (!deviceId || !from || !body) {
+      return res.status(400).json({ error: "Missing deviceId, from, or body" });
+    }
+
+    // Resolve device → location
+    const deviceDoc = await db.collection("sms_devices").doc(deviceId).get();
+    if (!deviceDoc.exists) {
+      console.error(`[SMS Inbound] Unknown device: ${deviceId}`);
+      return res.status(404).json({ error: "Device not registered" });
+    }
+    const locationId = deviceDoc.data().locationId;
+
+    const { getAccessToken, GHL_API_BASE } = require("./sms/_lib");
+    const token = await getAccessToken(locationId);
+    const headers = {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+      Version: "2021-04-15",
+    };
+
+    // 1. Find the contact by phone number (or create one)
+    const searchRes = await fetch(
+      `${GHL_API_BASE}/contacts/?locationId=${locationId}&query=${encodeURIComponent(from)}`,
+      { headers }
+    );
+    const searchData = await searchRes.json();
+    let contactId = searchData.contacts?.[0]?.id;
+
+    if (!contactId) {
+      const createRes = await fetch(`${GHL_API_BASE}/contacts/`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ locationId, phone: from, source: "SNBX SMS Inbound" }),
+      });
+      const created = await createRes.json();
+      contactId = created.contact?.id;
+      console.log(`[SMS Inbound] Created contact ${contactId} for ${from}`);
+    }
+
+    if (!contactId) {
+      console.error("[SMS Inbound] Could not find/create contact:", searchData);
+      return res.status(500).json({ error: "Contact resolution failed" });
+    }
+
+    // 2. Post the inbound message into Conversations
+    const msgRes = await fetch(`${GHL_API_BASE}/conversations/messages/inbound`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        type: "SMS",
+        contactId,
+        message: body,
+        conversationProviderId: process.env.GHL_SMS_PROVIDER_ID,
+      }),
+    });
+    const msgData = await msgRes.json();
+
+    if (!msgRes.ok) {
+      console.error("[SMS Inbound] GHL message post failed:", msgData);
+      return res.status(500).json({ error: "GHL post failed" });
+    }
+
+    console.log(`[SMS Inbound] Posted message from ${from} to contact ${contactId}`);
+    return res.status(200).json({ success: true });
+  } catch (err) {
+    console.error("[SMS Inbound] Error:", err);
     return res.status(500).json({ error: "Internal error" });
   }
 }
@@ -92,6 +215,7 @@ module.exports = async (req, res) => {
 
   if (route === "oauth/callback") return handleOAuthCallback(req, res);
   if (route === "outbound") return handleOutbound(req, res);
+  if (route === "inbound") return handleInbound(req, res);
 
   return res.status(404).json({ error: `Unknown SMS route: /${route}` });
 };
