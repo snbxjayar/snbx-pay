@@ -3,7 +3,10 @@
 //   /api/sms/oauth/callback → OAuth install
 //   /api/sms/outbound       → GHL Conversation Provider webhook
 //   /api/sms/inbound        → Gateway app posts incoming SMS
-const { db, admin, saveTokens, updateGHLMessageStatus } = require("./sms/_lib");
+const {
+  db, admin, saveTokens, saveCompanyTokens,
+  mintLocationToken, getInstalledLocations, updateGHLMessageStatus,
+} = require("./sms/_lib");
 
 // Normalize PH numbers to +639XXXXXXXXX
 function formatPHNumber(phone) {
@@ -51,20 +54,47 @@ async function handleOAuthCallback(req, res) {
       return res.status(500).send("OAuth token exchange failed");
     }
 
-    const locationId = tokens.locationId;
-    if (!locationId) {
-      console.error("[SMS OAuth] No locationId in token response:", tokens);
+    let connectedLocations = [];
+
+    if (tokens.locationId) {
+      // ── Standard sub-account install ──
+      await saveTokens(tokens.locationId, tokens);
+      connectedLocations = [tokens.locationId];
+      console.log(`[SMS OAuth] Installed for location ${tokens.locationId}`);
+
+    } else if (tokens.userType === "Company" && tokens.companyId) {
+      // ── Agency-level install: save company token, mint location tokens ──
+      console.log(`[SMS OAuth] Company-level install for ${tokens.companyId}`);
+      await saveCompanyTokens(tokens.companyId, tokens);
+
+      const locations = await getInstalledLocations(tokens.companyId);
+      console.log(`[SMS OAuth] App installed on ${locations.length} location(s)`);
+
+      for (const loc of locations) {
+        const locId = loc._id || loc.id || loc.locationId;
+        if (!locId) continue;
+        try {
+          await mintLocationToken(tokens.companyId, locId);
+          connectedLocations.push(locId);
+        } catch (e) {
+          console.error(`[SMS OAuth] Mint failed for ${locId}:`, e.message);
+        }
+      }
+
+      if (connectedLocations.length === 0) {
+        return res.status(500).send("Installed at agency level but no location tokens could be created.");
+      }
+
+    } else {
+      console.error("[SMS OAuth] Unrecognized token response shape");
       return res.status(500).send("No locationId returned");
     }
-
-    await saveTokens(locationId, tokens);
-    console.log(`[SMS OAuth] Installed for location ${locationId}`);
 
     res.setHeader("Content-Type", "text/html");
     return res.status(200).send(`
       <html><body style="font-family:Arial;text-align:center;padding:60px">
         <h2 style="color:#1a5c3f">✅ SNBX SMS Installed!</h2>
-        <p>Your sub-account is now connected. You can close this window.</p>
+        <p>Connected ${connectedLocations.length} sub-account(s). You can close this window.</p>
       </body></html>
     `);
   } catch (err) {
