@@ -2,6 +2,7 @@
 // Routes (via vercel.json rewrite):
 //   /api/sms/oauth/callback → OAuth install
 //   /api/sms/outbound       → GHL Conversation Provider webhook
+//   /api/sms/inbound        → Gateway app posts incoming SMS
 const { db, admin, saveTokens, updateGHLMessageStatus } = require("./sms/_lib");
 
 // Normalize PH numbers to +639XXXXXXXXX
@@ -84,8 +85,22 @@ async function handleOutbound(req, res) {
       return res.status(400).json({ error: "Missing locationId, phone, or message" });
     }
 
+    // ── Multi-tenant: resolve which device serves this location ──
+    const deviceSnap = await db
+      .collection("sms_devices")
+      .where("locationId", "==", locationId)
+      .limit(1)
+      .get();
+
+    if (deviceSnap.empty) {
+      console.error(`[SMS Outbound] No device registered for location ${locationId}`);
+      return res.status(404).json({ error: "No SMS device registered for this location" });
+    }
+    const deviceId = deviceSnap.docs[0].id;
+
     const jobRef = await db.collection("sms_jobs").add({
       locationId,
+      deviceId, // ← gateway filter key (multi-tenant)
       ghlMessageId: messageId || null,
       contactId: contactId || null,
       to: formatPHNumber(phone),
@@ -96,9 +111,9 @@ async function handleOutbound(req, res) {
       createdAt: new Date(),
     });
 
-    console.log(`[SMS Outbound] Queued job ${jobRef.id} for ${phone} (location ${locationId})`);
+    console.log(`[SMS Outbound] Queued job ${jobRef.id} for ${phone} (location ${locationId}, device ${deviceId})`);
 
-// ── FCM wake-up: nudge the gateway device (works even if app is killed) ──
+    // ── FCM wake-up: nudge the gateway device (works even if app is killed) ──
     try {
       await admin.messaging().send({
         topic: "sms_gateway",
@@ -134,6 +149,10 @@ async function handleOutbound(req, res) {
 // Called by the gateway app when a subscriber's phone receives an SMS
 async function handleInbound(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
+  if (req.headers["x-snbx-secret"] !== process.env.SNBX_GATEWAY_SECRET) {
+    console.error("[SMS Inbound] Invalid gateway secret");
+    return res.status(401).json({ error: "Unauthorized" });
+  }
 
   try {
     const { deviceId, from, body } = req.body || {};
