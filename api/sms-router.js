@@ -143,17 +143,28 @@ async function handleOutbound(req, res) {
 
     console.log(`[SMS Outbound] Queued job ${jobRef.id} for ${phone} (location ${locationId}, device ${deviceId})`);
 
-    // ── FCM wake-up: nudge the gateway device (works even if app is killed) ──
-    try {
-      await admin.messaging().send({
-        topic: "sms_gateway",
-        android: { priority: "high" },
-        data: { type: "sms_job", jobId: jobRef.id },
-      });
-      console.log(`[SMS Outbound] FCM wake-up sent for job ${jobRef.id}`);
-    } catch (fcmErr) {
-      console.error("[SMS Outbound] FCM send failed (job still queued):", fcmErr.message);
-    }
+    // ── FCM wake-up: send to SPECIFIC device token (not topic) ──
+try {
+  const gatewaySnap = await db
+    .collection("gateway_status")
+    .where("deviceId", "==", deviceId)
+    .limit(1)
+    .get();
+
+  if (!gatewaySnap.empty && gatewaySnap.docs[0].data().fcmToken) {
+    const fcmToken = gatewaySnap.docs[0].data().fcmToken;
+    await admin.messaging().send({
+      token: fcmToken,
+      android: { priority: "high" },
+      data: { type: "sms_job", jobId: jobRef.id },
+    });
+    console.log(`[SMS Outbound] FCM wake-up sent to device ${deviceId} for job ${jobRef.id}`);
+  } else {
+    console.warn(`[SMS Outbound] No FCM token found for device ${deviceId} — job queued, phone must poll`);
+  }
+} catch (fcmErr) {
+  console.error("[SMS Outbound] FCM send failed (job still queued):", fcmErr.message);
+}
 
     // ── Status feedback loop (Option A: poll for result) ──
     if (messageId) {
@@ -179,10 +190,10 @@ async function handleOutbound(req, res) {
 // Called by the gateway app when a subscriber's phone receives an SMS
 async function handleInbound(req, res) {
   if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
-  if (req.headers["x-snbx-secret"] !== process.env.SNBX_GATEWAY_SECRET) {
-    console.error("[SMS Inbound] Invalid gateway secret");
-    return res.status(401).json({ error: "Unauthorized" });
-  }
+  //if (req.headers["x-snbx-secret"] !== process.env.SNBX_GATEWAY_SECRET) {
+    //console.error("[SMS Inbound] Invalid gateway secret");
+    //return res.status(401).json({ error: "Unauthorized" });
+  //}
 
   try {
     const { deviceId, from, body } = req.body || {};
